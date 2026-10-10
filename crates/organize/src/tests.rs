@@ -227,6 +227,42 @@ fn full_save_drops_unreachable_objects() {
     assert_eq!(hayro_syntax::Pdf::new(bytes).unwrap().pages().len(), 1);
 }
 
+#[test]
+fn deleting_a_page_drops_the_named_destinations_to_it() {
+    // Four names (two in the /Names tree, two in the legacy /Dests dictionary) go to P1 or P3;
+    // P2 has a link for each. Deleting P1 must drop its names and their links, keep P3's.
+    let b: Vec<String> = vec![
+        "<< /Type /Catalog /Pages 2 0 R /Names << /Dests 6 0 R >> /Dests 7 0 R >>".into(), // 1
+        "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 /MediaBox [0 0 300 400] >>".into(), // 2
+        "<< /Type /Page /Parent 2 0 R >>".into(),                                          // 3
+        "<< /Type /Page /Parent 2 0 R /Annots [8 0 R 9 0 R 10 0 R 11 0 R] >>".into(),      // 4
+        "<< /Type /Page /Parent 2 0 R >>".into(),                                          // 5
+        "<< /Names [(treeFirst) [3 0 R /Fit] (treeLast) [5 0 R /Fit]] >>".into(),          // 6
+        "<< /legacyFirst [3 0 R /Fit] /legacyLast << /D [5 0 R /Fit] >> >>".into(),        // 7
+        "<< /Type /Annot /Subtype /Link /Rect [0 0 9 9] /Dest (treeFirst) >>".into(),      // 8
+        "<< /Type /Annot /Subtype /Link /Rect [0 0 9 9] /Dest (treeLast) >>".into(),       // 9
+        "<< /Type /Annot /Subtype /Link /Rect [0 0 9 9] /Dest /legacyFirst >>".into(),     // 10
+        "<< /Type /Annot /Subtype /Link /Rect [0 0 9 9] /A << /S /GoTo /D /legacyLast >> >>".into(), // 11
+    ];
+    let mut doc = open(build(&b, "/Root 1 0 R"));
+    delete_pages(&mut doc, &[0]).unwrap();
+    let out = full_roundtrip(&doc);
+    let cat = out.get(out.root().unwrap()).as_dict().cloned().unwrap();
+    let tree = out.resolve(out.resolve(cat.get(b"Names").unwrap()).as_dict().unwrap().get(b"Dests").unwrap());
+    let pairs = tree.as_dict().unwrap().get(b"Names").and_then(Object::as_array).cloned().unwrap();
+    assert_eq!(pairs.len(), 2, "{pairs:?}");
+    assert_eq!(pairs[0].as_string().map(|s| s.bytes.clone()), Some(b"treeLast".to_vec()));
+    let page3 = pages(&out).unwrap()[1].obj;
+    assert_eq!(out.resolve(&pairs[1]).as_array().and_then(|a| a.first()).and_then(Object::as_ref), Some(page3));
+    let legacy = out.resolve(cat.get(b"Dests").unwrap()).as_dict().cloned().unwrap();
+    assert!(!legacy.contains(b"legacyFirst") && legacy.contains(b"legacyLast"), "{legacy:?}");
+    let links = annots(&out, 0);
+    assert!(!links[0].contains(b"Dest"), "{:?}", links[0]);
+    assert!(links[1].contains(b"Dest"), "{:?}", links[1]);
+    assert!(!links[2].contains(b"Dest"), "{:?}", links[2]);
+    assert!(links[3].contains(b"A"), "{:?}", links[3]);
+}
+
 // ── Combine / extract / split ──────────────────────────────────────────────────────────────────
 
 /// Build a classic-xref PDF from object bodies (object i+1 = bodies[i]).
