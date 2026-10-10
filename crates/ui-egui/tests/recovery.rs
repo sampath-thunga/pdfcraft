@@ -155,19 +155,8 @@ fn quitting_cleanly_leaves_nothing_behind() {
 
 #[test]
 fn encrypted_documents_are_autosaved_encrypted_and_recovered_with_the_password() {
-    let mut doc = pdfcraft_cos::Document::open(std::sync::Arc::new(fixture(2))).unwrap();
-    doc.set_encryption(&pdfcraft_cos::NewEncryption {
-        algorithm: pdfcraft_cos::Algorithm::Aes256,
-        user_password: "pw",
-        owner_password: "owner",
-        permissions: -1,
-        encrypt_metadata: true,
-        seed: [2; 32],
-    })
-    .unwrap();
-    let bytes = pdfcraft_cos::write_full(&doc, &Default::default()).unwrap();
     let s = store("encrypted");
-    crashed_session(&s, bytes, Some("pw"), None);
+    crashed_session(&s, encrypted(2), Some("pw"), None);
     let meta = s.list().remove(0);
     assert!(meta.encrypted);
     let saved = s.read(&meta.key).unwrap();
@@ -231,4 +220,60 @@ fn control_click_effects_are_visible_when_the_reply_arrives() {
     call(&mut h, "ui.click", serde_json::json!({ "label": "Discard" }));
     assert_eq!(files_in(&s), 0, "discarded by the time the click is answered");
     assert_eq!(call(&mut h, "ui.state", serde_json::json!({}))["dialog"], serde_json::Value::Null);
+}
+
+fn encrypted(seed: u8) -> Vec<u8> {
+    let mut doc = pdfcraft_cos::Document::open(std::sync::Arc::new(fixture(2))).unwrap();
+    doc.set_encryption(&pdfcraft_cos::NewEncryption {
+        algorithm: pdfcraft_cos::Algorithm::Aes256,
+        user_password: "pw",
+        owner_password: "owner",
+        permissions: -1,
+        encrypt_metadata: true,
+        seed: [seed; 32],
+    })
+    .unwrap();
+    pdfcraft_cos::write_full(&doc, &Default::default()).unwrap()
+}
+
+/// An encrypted entry is recovered and its password prompt is up (#813).
+fn recovering_encrypted(tag: &str) -> (RecoveryStore, Harness<'static, PdfCraftApp>) {
+    let s = store(tag);
+    crashed_session(&s, encrypted(2), Some("pw"), Some("/original/a.pdf"));
+    let mut h = harness(s.clone());
+    h.get_by_label("Recover").click();
+    h.run_steps(3);
+    assert!(h.state().password_prompt.is_some());
+    (s, h)
+}
+
+/// Another unlocked file keeps its own path, stays clean and doesn't take the snapshot's entry.
+fn assert_unrelated(h: &Harness<'static, PdfCraftApp>, s: &RecoveryStore) {
+    let app = h.state();
+    assert_eq!(app.views.len(), 1);
+    let d = app.session.get(app.views[0].id).unwrap();
+    assert_eq!(d.path.as_deref(), Some("/original/b.pdf"), "Save must not overwrite the recovered file's original");
+    assert!(!d.dirty);
+    assert_eq!(s.list().len(), 1, "the snapshot stays recoverable");
+}
+
+#[test]
+fn cancelling_a_recovery_password_does_not_taint_the_next_document() {
+    let (s, mut h) = recovering_encrypted("cancel");
+    h.state_mut().submit_password(None);
+    h.run_steps(2);
+    let app = h.state_mut();
+    app.open_bytes("b.pdf", Some("/original/b.pdf".into()), encrypted(3)).unwrap();
+    app.submit_password(Some("pw".into()));
+    assert_unrelated(&h, &s);
+}
+
+#[test]
+fn a_file_opened_over_a_recovery_password_prompt_is_not_the_recovered_document() {
+    let (s, mut h) = recovering_encrypted("replace");
+    // Opened while the prompt is up (an OS open request): its prompt replaces the snapshot's.
+    let app = h.state_mut();
+    app.open_bytes("b.pdf", Some("/original/b.pdf".into()), encrypted(3)).unwrap();
+    app.submit_password(Some("pw".into()));
+    assert_unrelated(&h, &s);
 }

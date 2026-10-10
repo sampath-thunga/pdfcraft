@@ -1047,12 +1047,18 @@ impl PdfCraftApp {
     /// Answer the password prompt (`None` cancels).
     pub fn submit_password(&mut self, password: Option<String>) {
         let Some(p) = self.password_prompt.take() else { return };
-        let Some(pw) = password else { return };
+        let Some(pw) = password else {
+            // Cancelling abandons a pending recovery: its document is not opened.
+            self.pending_recovered = None;
+            return;
+        };
+        // Only the recovered snapshot's own prompt (opened by name, without a path) finishes its recovery.
+        let recovering = self.pending_recovered.as_ref().is_some_and(|m| m.name == p.name && p.path.is_none());
         match self.try_open(&p.name, p.path, p.bytes, Some(&pw), p.activate) {
             Err(e) => self.notify_fmt("Couldn't open {name}: {e}", &[("name", &p.name), ("e", &e.to_string())]),
             // A recovered encrypted document is open once its foreground prompt is gone.
-            // Unlocking a background startup file must not finish another file's recovery.
-            Ok(()) if p.activate && self.password_prompt.is_none() => {
+            // Unlocking a background startup file or another file must not finish its recovery.
+            Ok(()) if recovering && p.activate && self.password_prompt.is_none() => {
                 if let Some(meta) = self.pending_recovered.clone() {
                     self.finish_recovery(&meta);
                 }
