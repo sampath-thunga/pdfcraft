@@ -2312,6 +2312,27 @@ fn stamps_through_tools() {
 }
 
 #[test]
+fn bookmark_split_with_equal_titles_keeps_every_part() {
+    let dir = workdir("organize_dup_titles");
+    let mut a = auto(&dir);
+    let doc = ok(&mut a, "doc_open", json!({ "path": "a.pdf" }))["doc"].as_u64().unwrap();
+    ok(&mut a, "bookmark_add", json!({ "doc": doc, "title": "Same", "page": 1 }));
+    ok(&mut a, "bookmark_add", json!({ "doc": doc, "title": "Same", "page": 2 }));
+    ok(&mut a, "bookmark_add", json!({ "doc": doc, "title": "same", "page": 3 }));
+    let s = ok(&mut a, "doc_split", json!({ "doc": doc, "bookmarks": true, "out_dir": "parts" }));
+    let files: Vec<String> = s["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| std::path::Path::new(f["path"].as_str().unwrap()).file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(files, ["a-Same.pdf", "a-Same-2.pdf", "a-same-3.pdf"]);
+    for f in &files {
+        assert!(dir.join("parts").join(f).exists(), "{f} missing");
+    }
+}
+
+#[test]
 fn organizing_with_filters_bookmark_splits_and_extract_options() {
     let dir = workdir("organize2");
     let mut a = auto(&dir);
