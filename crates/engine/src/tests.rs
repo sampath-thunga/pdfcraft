@@ -578,6 +578,19 @@ fn autosave_snapshots_only_changed_documents() {
 }
 
 #[test]
+fn autosave_snapshots_a_new_unsaved_document_once() {
+    let (mut s, clean) = session_with(1);
+    let id = s.open_new("Untitled.pdf", Arc::new(fixture(1))).unwrap();
+    let snaps = s.autosave_snapshots();
+    assert_eq!(snaps.len(), 1, "the new document is unsaved work");
+    assert_eq!(snaps[0].doc, id);
+    assert!(snaps.iter().all(|x| x.doc != clean), "the clean document stays out");
+    assert!(s.autosave_snapshots().is_empty(), "nothing new since the last snapshot");
+    s.apply(id, Edit::RotatePages { pages: vec![0], degrees: 90 }).unwrap();
+    assert_eq!(s.autosave_snapshots().len(), 1, "a later edit is snapshotted again");
+}
+
+#[test]
 fn recovered_documents_reopen_unsaved_at_their_original_path() {
     let (mut s, id) = session_with(2);
     s.apply(id, Edit::DeletePages { pages: vec![1] }).unwrap();

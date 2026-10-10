@@ -2890,6 +2890,8 @@ impl Session {
         let id = self.open(name, None, bytes, None)?;
         if let Some(d) = self.docs.iter_mut().find(|d| d.id == id) {
             d.dirty = true;
+            // Unsaved work with no edit yet still needs its first recovery snapshot.
+            d.generation += 1;
         }
         Ok(id)
     }
