@@ -189,7 +189,7 @@ fn verdict(leaf: Party, embedded: Vec<Certificate>, anchor: &Certificate) -> (St
     let doc = Document::open(Arc::new(fixture())).unwrap();
     let opts = SignOptions { page: 0, rect: None, date: "D:20260601120000Z".into(), ..SignOptions::default() };
     let signed = pdfcraft_sign::sign(&doc, &id, &opts).unwrap();
-    let trust = TrustStore { certs: vec![anchor.clone()] };
+    let trust = TrustStore { certs: vec![anchor.clone()], ..TrustStore::default() };
     let s = signatures(&Document::open(Arc::new(signed.clone())).unwrap(), &signed, &trust).into_iter().rfind(|s| s.signed).unwrap();
     (s.status, s.details)
 }
@@ -238,4 +238,160 @@ fn unreadable_constraint_extensions_fail_closed() {
     let garbage = ext("2.5.29.19", &[0x30, 0x05, 0x01]);
     let c = issue("Garbled Constraints", None, FOREVER, &[garbage]);
     assert!(c.cert.has_basic_constraints && !c.cert.is_ca && !c.cert.may_issue());
+}
+
+/// Like `verdict`, but with a whole `TrustStore`.
+fn verdict_with(leaf: Party, embedded: Vec<Certificate>, trust: &TrustStore) -> (Status, Vec<String>) {
+    let id = DigitalId { key: leaf.key, certificate: leaf.cert, chain: embedded, friendly_name: None };
+    let doc = Document::open(Arc::new(fixture())).unwrap();
+    let opts = SignOptions { page: 0, rect: None, date: "D:20260601120000Z".into(), ..SignOptions::default() };
+    let signed = pdfcraft_sign::sign(&doc, &id, &opts).unwrap();
+    let s = signatures(&Document::open(Arc::new(signed.clone())).unwrap(), &signed, trust).into_iter().rfind(|s| s.signed).unwrap();
+    (s.status, s.details)
+}
+
+#[test]
+fn trust_sets_are_off_by_default_and_a_loaded_list_is_named_when_it_vouches() {
+    use pdfcraft_sign::trust::TrustList;
+    let r = root();
+    let i = ca("Issuing CA", &r, None);
+    let leaf = |cn: &str| end_entity(cn, &i);
+    let list = TrustList::from_bytes("Test List", &r.cert.raw).unwrap();
+
+    // Nothing is trusted unless asked for: no list, no built-in roots.
+    let none = TrustStore::default();
+    assert!(!none.builtin_roots && none.lists.is_empty() && none.certs.is_empty());
+    let (status, details) = verdict_with(leaf("Signer A"), vec![i.cert.clone()], &none);
+    assert_eq!(status, Status::Unknown, "{details:?}");
+
+    // With the list loaded, the same signature is valid and says which list vouched.
+    let with_list = TrustStore { lists: vec![list.clone()], ..TrustStore::default() };
+    let (status, details) = verdict_with(leaf("Signer B"), vec![i.cert.clone()], &with_list);
+    assert_eq!(status, Status::Valid, "{details:?}");
+    assert!(details.iter().any(|d| d.contains("Test List")), "{details:?}");
+
+    // The built-in roots are not these roots, so switching them on changes nothing here.
+    let builtin = TrustStore { builtin_roots: true, ..TrustStore::default() };
+    let (status, _) = verdict_with(leaf("Signer C"), vec![i.cert.clone()], &builtin);
+    assert_eq!(status, Status::Unknown);
+
+    // A list does not make a subscriber a CA: the forged identity stays unknown.
+    let subscriber = end_entity("Ordinary Subscriber", &r);
+    let forged = end_entity("Forged Identity", &subscriber);
+    let (status, details) = verdict_with(forged, vec![subscriber.cert.clone()], &with_list);
+    assert_eq!(status, Status::Unknown, "{details:?}");
+}
+
+#[test]
+fn the_builtin_roots_only_anchor_when_switched_on() {
+    // Trust is decided by `source_of`, which is what validation uses.
+    let first = pdfcraft_sign::trust::builtin_roots().first().unwrap();
+    let off = TrustStore::default();
+    assert_eq!(off.source_of(first), None);
+    let on = TrustStore { builtin_roots: true, ..TrustStore::default() };
+    assert_eq!(on.source_of(first), Some(pdfcraft_sign::TrustSource::BuiltinRoots));
+    // The user's own list wins when both apply.
+    let both = TrustStore { certs: vec![first.clone()], builtin_roots: true, ..TrustStore::default() };
+    assert_eq!(both.source_of(first), Some(pdfcraft_sign::TrustSource::User));
+}
+
+// ── what a trust set vouches for ───────────────────────────────────────────────────────────────
+// The built-in roots and loaded lists trust a CA for everything it issues, and most of those CAs
+// issue TLS certificates. A certificate that is not meant for signing documents is not vouched for
+// by them; the user's own trusted certificates are their decision and are never second-guessed.
+
+fn extended_key_usage(purposes: &[&str]) -> Vec<u8> {
+    let oids: Vec<Vec<u8>> = purposes.iter().map(|p| der::oid(p)).collect();
+    let refs: Vec<&[u8]> = oids.iter().map(Vec::as_slice).collect();
+    ext("2.5.29.37", &der::seq(&refs))
+}
+
+/// An extended key usage whose entries are the given encodings (they need not be OIDs).
+fn extended_key_usage_raw(entries: &[Vec<u8>]) -> Vec<u8> {
+    let refs: Vec<&[u8]> = entries.iter().map(Vec::as_slice).collect();
+    ext("2.5.29.37", &der::seq(&refs))
+}
+
+const SERVER_AUTH: &str = "1.3.6.1.5.5.7.3.1";
+const CLIENT_AUTH: &str = "1.3.6.1.5.5.7.3.2";
+const EMAIL_PROTECTION: &str = "1.3.6.1.5.5.7.3.4";
+const ADOBE_DOCUMENT_SIGNING: &str = "1.2.840.113583.1.1.5";
+const ANY_EXTENDED_KEY_USAGE: &str = "2.5.29.37.0";
+const NON_REPUDIATION: u8 = 0x40;
+
+#[test]
+fn a_trust_set_does_not_vouch_for_a_certificate_that_is_not_meant_for_signing_documents() {
+    use pdfcraft_sign::trust::TrustList;
+    let r = root();
+    let i = ca("Issuing CA", &r, None);
+    let with_list = TrustStore { lists: vec![TrustList::from_bytes("Test List", &r.cert.raw).unwrap()], ..TrustStore::default() };
+    let leaf = |cn: &str, usage: u8, purposes: Option<&[&str]>| {
+        let mut exts = vec![basic_constraints(false, None), key_usage(usage)];
+        exts.extend(purposes.map(extended_key_usage));
+        issue(cn, Some(&i), FOREVER, &exts)
+    };
+    let verdict_of = |l: Party, trust: &TrustStore| verdict_with(l, vec![i.cert.clone()], trust).0;
+
+    // An ordinary TLS server certificate of the trusted CA: the CA vouches for it as a web site,
+    // not as someone who signs documents.
+    let tls = || leaf("www.example.com", DIGITAL_SIGNATURE, Some(&[SERVER_AUTH, CLIENT_AUTH]));
+    let (status, details) = verdict_with(tls(), vec![i.cert.clone()], &with_list);
+    assert_eq!(status, Status::Unknown, "{details:?}");
+    assert!(details.iter().any(|d| d.contains("not meant for signing documents")), "{details:?}");
+    // The same certificate is fine when the user trusts the root themselves: their decision.
+    let mine = TrustStore { certs: vec![r.cert.clone()], ..TrustStore::default() };
+    assert_eq!(verdict_of(tls(), &mine), Status::Valid);
+    // An extended key usage that can't be read allows nothing (it used to allow everything).
+    let garbled =
+        issue("Garbled EKU", Some(&i), FOREVER, &[basic_constraints(false, None), key_usage(DIGITAL_SIGNATURE), ext("2.5.29.37", &[0xff, 0x00])]);
+    assert_eq!(verdict_of(garbled, &with_list), Status::Unknown);
+    // A key usage without digitalSignature or nonRepudiation is no signing certificate either.
+    assert_eq!(verdict_of(leaf("Key Agreement", 0x08, None), &with_list), Status::Unknown);
+
+    // What is meant for signing documents is vouched for.
+    for (what, l) in [
+        ("e-mail protection", leaf("Mail", DIGITAL_SIGNATURE, Some(&[CLIENT_AUTH, EMAIL_PROTECTION]))),
+        ("Adobe document signing", leaf("Adobe", NON_REPUDIATION, Some(&[ADOBE_DOCUMENT_SIGNING]))),
+        ("any purpose", leaf("Any", DIGITAL_SIGNATURE, Some(&[ANY_EXTENDED_KEY_USAGE]))),
+        ("no extended key usage", leaf("Unrestricted", DIGITAL_SIGNATURE, None)),
+    ] {
+        let (status, details) = verdict_with(l, vec![i.cert.clone()], &with_list);
+        assert_eq!(status, Status::Valid, "{what}: {details:?}");
+    }
+}
+
+#[test]
+fn certificate_purposes_are_read_from_key_usage_and_extended_key_usage() {
+    let r = root();
+    let make = |usage: Option<u8>, purposes: Option<&[&str]>| {
+        let mut exts = vec![basic_constraints(false, None)];
+        exts.extend(usage.map(key_usage));
+        exts.extend(purposes.map(extended_key_usage));
+        issue("Purpose", Some(&r), FOREVER, &exts).cert
+    };
+    assert!(make(None, None).may_sign_documents(), "no restriction at all");
+    assert!(make(Some(DIGITAL_SIGNATURE), None).may_sign_documents());
+    assert!(make(Some(NON_REPUDIATION), None).may_sign_documents());
+    assert!(!make(Some(KEY_CERT_SIGN), None).may_sign_documents(), "a CA-only key");
+    assert!(!make(None, Some(&[SERVER_AUTH])).may_sign_documents());
+    assert!(!make(Some(DIGITAL_SIGNATURE), Some(&[SERVER_AUTH])).may_sign_documents());
+    assert!(make(None, Some(&[SERVER_AUTH, EMAIL_PROTECTION])).may_sign_documents());
+    // Every purpose that names signing documents.
+    for purpose in [ADOBE_DOCUMENT_SIGNING, "1.3.6.1.5.5.7.3.36", "1.3.6.1.4.1.311.10.3.12"] {
+        assert!(make(None, Some(&[SERVER_AUTH, purpose])).may_sign_documents(), "{purpose}");
+    }
+    // An extension that is present restricts the key even when it doesn't parse: an unreadable one
+    // allows no purpose at all, never every purpose (fail closed, as for keyUsage and basicConstraints).
+    let garbled = |ext_oid: &str| issue("Garbled", Some(&r), FOREVER, &[basic_constraints(false, None), ext(ext_oid, &[0xff, 0x00])]).cert;
+    let bad_eku = garbled("2.5.29.37");
+    assert_eq!(bad_eku.extended_key_usage.as_deref(), Some(&[][..]));
+    assert!(!bad_eku.may_sign_documents() && !bad_eku.may_timestamp());
+    // A purpose that isn't an OID grants nothing either.
+    let not_an_oid = issue("Not An OID", Some(&r), FOREVER, &[extended_key_usage_raw(&[der::int(1)])]).cert;
+    assert!(!not_an_oid.may_sign_documents());
+    // A time-stamp authority has to say so (RFC 3161 §2.3), unlike a signer.
+    assert!(!make(None, None).may_timestamp());
+    assert!(!make(None, Some(&[EMAIL_PROTECTION])).may_timestamp());
+    assert!(!make(None, Some(&[ANY_EXTENDED_KEY_USAGE])).may_timestamp());
+    assert!(make(Some(DIGITAL_SIGNATURE), Some(&["1.3.6.1.5.5.7.3.8"])).may_timestamp());
 }

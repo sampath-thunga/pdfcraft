@@ -188,16 +188,85 @@ impl DigestCache {
     }
 }
 
-/// Certificates the user trusts for signing (Acrobat: Trusted Certificates).
+/// Certificates trusted for signing (Acrobat: Trusted Certificates). Only `certs`, the user's own
+/// list, is trusted by default; the other two are sets the user has to switch on.
 #[derive(Clone, Debug, Default)]
 pub struct TrustStore {
     pub certs: Vec<Certificate>,
+    /// Also trust the embedded roots of commercial CAs ([`crate::trust::builtin_roots`]).
+    pub builtin_roots: bool,
+    /// Also trust these lists the user loaded (e.g. the EU Trusted Lists' qualified CAs).
+    pub lists: Vec<crate::trust::TrustList>,
+}
+
+/// Why a certificate in a chain is trusted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TrustSource {
+    /// The user's own list of trusted certificates.
+    User,
+    /// A root embedded in PdfCraft ([`crate::trust::builtin_roots`]).
+    BuiltinRoots,
+    /// The named list the user loaded.
+    List(String),
 }
 
 impl TrustStore {
-    fn trusts(&self, c: &Certificate) -> bool {
-        self.certs.iter().any(|t| t.raw == c.raw)
+    /// Load `list`, replacing a list of the same name, or with `None` remove the list `name`.
+    pub fn set_list(&mut self, name: &str, list: Option<crate::trust::TrustList>) {
+        self.lists.retain(|l| l.name != name);
+        self.lists.extend(list);
     }
+
+    /// Every certificate that is a trust anchor right now: the user's, then the sets switched on.
+    fn anchors(&self) -> impl Iterator<Item = &Certificate> + Clone {
+        let builtin: &[Certificate] = if self.builtin_roots { crate::trust::builtin_roots() } else { &[] };
+        self.certs.iter().chain(builtin).chain(self.lists.iter().flat_map(|l| l.certs.iter()))
+    }
+
+    /// What makes `c` trusted, if anything. The user's own list wins over the sets.
+    pub fn source_of(&self, c: &Certificate) -> Option<TrustSource> {
+        if self.certs.iter().any(|t| t.raw == c.raw) {
+            Some(TrustSource::User)
+        } else if self.builtin_roots && crate::trust::is_builtin_root(c) {
+            Some(TrustSource::BuiltinRoots)
+        } else {
+            self.lists.iter().find(|l| l.certs.iter().any(|t| t.raw == c.raw)).map(|l| TrustSource::List(l.name.clone()))
+        }
+    }
+
+    /// The first trusted certificate going up `chain` (the leaf first), and what makes it trusted.
+    ///
+    /// The user's own certificates vouch as the user decided. The sets (built-in roots, loaded
+    /// lists) trust a CA for everything it issues, and most of those CAs issue TLS certificates, so
+    /// a set only vouches for a leaf meant for `purpose`. The flag says a set would have vouched
+    /// but for the leaf's purpose, so the details can say why it didn't.
+    fn anchor<'a>(&self, chain: impl IntoIterator<Item = &'a Certificate> + Clone, purpose: Purpose) -> (Option<(String, TrustSource)>, bool) {
+        let leaf_fits = chain.clone().into_iter().next().is_none_or(|leaf| match purpose {
+            Purpose::SignDocuments => leaf.may_sign_documents(),
+            Purpose::Timestamp => leaf.may_timestamp(),
+        });
+        let mut refused = false;
+        for c in chain {
+            match self.source_of(c) {
+                Some(TrustSource::User) => return (Some((c.display_name(), TrustSource::User)), false),
+                Some(set) if leaf_fits => return (Some((c.display_name(), set)), false),
+                Some(_) => refused = true,
+                None => {}
+            }
+        }
+        (None, refused)
+    }
+}
+
+const NOT_A_TSA: &str = "The timestamp authority's certificate chains to a root in a trust set you switched on, but it is not meant for time stamps (RFC 3161 §2.3 asks for the time-stamping purpose), so the set does not vouch for it.";
+
+/// What a trusted certificate is trusted to vouch for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    /// The signer of a document.
+    SignDocuments,
+    /// A time-stamp authority.
+    Timestamp,
 }
 
 /// Acrobat's three verdicts.
@@ -557,15 +626,19 @@ fn validate_into(doc: &Document, bytes: &[u8], trust: &TrustStore, v: &Dict, inf
                     // Only a token from a trusted authority (valid when it stamped) is trusted
                     // time; otherwise its time is reported but validation uses the signer's
                     // own claimed time, as without a timestamp.
-                    let mut pool = crate::timestamp::token_certs(raw);
-                    pool.extend(trust.certs.iter().cloned());
-                    let trusted_tsa = t
-                        .signer_certificate()
-                        .is_some_and(|c| c.valid_at(t.gen_time) && build_chain(&c, &pool, Some(t.gen_time)).iter().any(|x| trust.trusts(x)));
+                    let embedded = crate::timestamp::token_certs(raw);
+                    let (trusted_tsa, wrong_purpose) = t.signer_certificate().filter(|c| c.valid_at(t.gen_time)).map_or((false, false), |c| {
+                        let chain = build_chain(&c, embedded.iter().chain(trust.anchors()), Some(t.gen_time));
+                        let (anchor, wrong_purpose) = trust.anchor(chain.iter().copied(), Purpose::Timestamp);
+                        (anchor.is_some(), wrong_purpose)
+                    });
                     if trusted_tsa {
                         info.timestamp_time = Some(t.gen_time);
                     } else {
                         unverified_time = Some(t.gen_time);
+                        if wrong_purpose {
+                            info.details.push(NOT_A_TSA.into());
+                        }
                     }
                 }
             }
@@ -628,19 +701,25 @@ fn finish_validation(
     unverified_time: Option<Time>,
 ) {
     info.signing_time = cms_time.or_else(|| info.date.as_deref().and_then(Time::from_pdf));
-    let mut pool = embedded.to_vec();
-    pool.extend(trust.certs.iter().cloned());
     // The time the chain is judged at: trusted timestamp, else the signer's claimed time.
     let at = info.timestamp_time.or(info.signing_time);
-    let (chain, refused) = build_chain_noted(&cert, &pool, at);
+    let (chain, refused) = build_chain_noted(&cert, embedded.iter().chain(trust.anchors()), at);
     let chain: Vec<Certificate> = chain.into_iter().cloned().collect();
-    let trusted = chain.iter().any(|c| trust.trusts(c));
+    // The first trusted certificate going up the chain, and what makes it trusted.
+    let (anchor, wrong_purpose) = trust.anchor(&chain, Purpose::SignDocuments);
+    let trusted = anchor.is_some();
     info.chain = chain;
     info.certificate = Some(cert.clone());
     if let Some(why) = refused
         && !trusted
     {
         info.details.push(why);
+    }
+    if wrong_purpose {
+        info.details.push(
+            "The certificate chains to a root in a trust set you switched on, but it is not meant for signing documents (its key usage or extended key usage excludes it), so the set does not vouch for it."
+                .into(),
+        );
     }
     // Revocation evidence embedded in the document security store, if any. A verified
     // revocation is final: later blocks must not soften the verdict.
@@ -685,6 +764,13 @@ fn finish_validation(
         }
     } else {
         info.details.push("The signer's identity is valid.".into());
+        match anchor {
+            Some((root, TrustSource::BuiltinRoots)) => {
+                info.details.push(format!("Its certificate chains to a root built into PdfCraft that you switched on ({root})."))
+            }
+            Some((root, TrustSource::List(list))) => info.details.push(format!("Its certificate chains to {root} in the trust list \"{list}\".")),
+            _ => {}
+        }
         if !problems && !revoked {
             info.status = Status::Valid;
         }
@@ -832,12 +918,15 @@ fn validate_doc_timestamp(doc: &Document, bytes: &[u8], v: &Dict, info: &mut Sig
     if info.status != Status::Invalid {
         // An untrusted TSA is not proof of anything: the verdict stays Unknown, like an
         // ordinary signature from an unknown signer.
-        let mut pool = crate::timestamp::token_certs(&contents);
-        pool.extend(trust.certs.iter().cloned());
+        let embedded = crate::timestamp::token_certs(&contents);
         // A trusted authority whose certificate was not valid at the time it stamped proves
         // nothing either (its detail is already recorded above): never upgrade that to Valid.
         let in_validity = token.signer_certificate().is_some_and(|c| c.valid_at(token.gen_time));
-        let trusted_tsa = token.signer_certificate().is_some_and(|c| build_chain(&c, &pool, Some(token.gen_time)).iter().any(|x| trust.trusts(x)));
+        let (trusted_tsa, wrong_purpose) = token.signer_certificate().map_or((false, false), |c| {
+            let chain = build_chain(&c, embedded.iter().chain(trust.anchors()), Some(token.gen_time));
+            let (anchor, wrong_purpose) = trust.anchor(chain.iter().copied(), Purpose::Timestamp);
+            (anchor.is_some(), wrong_purpose)
+        });
         if trusted_tsa && in_validity {
             info.status = Status::Valid;
             info.details.push("The timestamp token is valid and its authority is trusted.".into());
@@ -846,6 +935,9 @@ fn validate_doc_timestamp(doc: &Document, bytes: &[u8], v: &Dict, info: &mut Sig
         } else {
             info.status = Status::Unknown;
             info.details.push("The timestamp token is valid, but the timestamp authority is not in your list of trusted certificates.".into());
+            if wrong_purpose {
+                info.details.push(NOT_A_TSA.into());
+            }
         }
     }
 }
