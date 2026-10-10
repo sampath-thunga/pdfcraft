@@ -357,6 +357,35 @@ fn links_are_rewired_to_copied_pages_or_dropped() {
 }
 
 #[test]
+fn repeated_page_gets_independent_annotations() {
+    // A1 has a link, A2 a link and a form field, A3 a note with a popup; each is listed twice.
+    let out = full_roundtrip(&extract_pages(&doc_a(), &[0, 0, 1, 1, 2, 2]).unwrap());
+    let ps = pages(&out).unwrap();
+    let refs: Vec<Vec<ObjRef>> = (0..6)
+        .map(|i| page_dict(&out, i).get(b"Annots").map(|a| out.resolve(a).as_array().cloned().unwrap_or_default()).unwrap_or_default())
+        .map(|list| list.iter().filter_map(|a| a.as_ref()).collect())
+        .collect();
+    for i in (0..6).step_by(2) {
+        assert!(!refs[i].is_empty());
+        assert_eq!(refs[i].len(), refs[i + 1].len());
+        for (a, b) in refs[i].iter().zip(&refs[i + 1]) {
+            assert_ne!(a, b, "each copy of the page has its own annotation objects");
+        }
+    }
+    for (i, list) in refs.iter().enumerate() {
+        for a in list {
+            assert_eq!(out.get(*a).as_dict().unwrap().reference(b"P"), Some(ps[i].obj), "/P names the page holding the copy");
+        }
+    }
+    // Each note keeps its own popup, pointing back at that note.
+    let popups: Vec<ObjRef> = [4, 5].iter().map(|&i| out.get(refs[i][0]).as_dict().unwrap().reference(b"Popup").unwrap()).collect();
+    assert_ne!(popups[0], popups[1]);
+    for (k, p) in popups.iter().enumerate() {
+        assert_eq!(out.get(*p).as_dict().unwrap().reference(b"Parent"), Some(refs[4 + k][0]));
+    }
+}
+
+#[test]
 fn form_fields_come_along_and_are_registered() {
     let out = full_roundtrip(&extract_pages(&doc_a(), &[1]).unwrap());
     let cat = out.get(out.root().unwrap()).as_dict().cloned().unwrap();
