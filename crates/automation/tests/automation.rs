@@ -2613,8 +2613,11 @@ fn digital_ids_signing_and_validation_through_tools() {
     let ids = store["ids"].as_array().unwrap();
     assert_eq!(store["count"].as_u64().unwrap(), ids.len() as u64);
     assert!(ids.iter().all(|id| id["id"].as_str().unwrap().starts_with("windows:")));
+    // Store certificates that can't sign are explained, not dropped (issue #179).
+    let unusable = store["unusable"].as_array().unwrap();
+    assert!(unusable.iter().all(|u| u["subject"].is_string() && !u["reason"].as_str().unwrap().is_empty() && u["no_private_key"].is_boolean()));
     #[cfg(not(windows))]
-    assert!(ids.is_empty());
+    assert!(ids.is_empty() && unusable.is_empty());
     assert!(matches!(
         a.call("sign_document", &json!({ "doc": doc, "id": "ada.p12", "password": "wrong!", "out": "signed.pdf" })),
         Err(ToolError::InvalidArgs(_))

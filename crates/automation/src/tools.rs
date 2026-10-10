@@ -602,7 +602,7 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             &["name", "password", "path"],
         )),
-        t("sign_windows_ids", "List Windows store digital IDs", "Windows: signing identities in the Current User Personal certificate store (certificate details and the windows: reference sign_document takes). Private keys remain in CNG; Windows may ask permission to use them.")
+        t("sign_windows_ids", "List Windows store digital IDs", "Windows: signing identities in the Current User Personal certificate store (certificate details and the windows: reference sign_document takes). Private keys remain in CNG; Windows may ask permission to use them. `unusable` lists the store's other certificates with why they can't sign (no private key, an unsupported key type, a key CNG can't open).")
             .ro()
             .cmd("sign.digital")
             .with(schema(json!({}), &[])),
