@@ -264,6 +264,12 @@ fn xfdf_annots(doc: &Document, out: &mut String) {
                 }
                 out.push_str("</inklist>");
             }
+            // Polygon and polyline points (XFDF `<vertices>`: `x,y;x,y;…`).
+            let vertices = nums_of(doc, d.get(b"Vertices"));
+            let pts: Vec<String> = vertices.as_chunks::<2>().0.iter().map(|p| format!("{},{}", n(p[0]), n(p[1]))).collect();
+            if !pts.is_empty() {
+                let _ = write!(out, "<vertices>{}</vertices>", pts.join(";"));
+            }
             if let Some(pd) = d.get(b"Popup").map(|p| doc.resolve(p)).and_then(|p| p.as_dict().cloned()) {
                 let r = nums_of(doc, pd.get(b"Rect"));
                 if r.len() == 4 {
@@ -616,6 +622,14 @@ fn annot_from_xml(node: roxmltree::Node, subtype: &str, page_ref: ObjRef) -> Opt
                     .map(|g| arr(&g.text().unwrap_or("").split(';').flat_map(|p| csv(p).into_iter()).collect::<Vec<_>>()))
                     .collect();
                 d.set(b"InkList".to_vec(), Object::Array(list));
+            }
+            "vertices" => {
+                // Whole x,y pairs only; a stray trailing number is dropped.
+                let mut v = csv(child.text().unwrap_or(""));
+                v.truncate(v.len() - v.len() % 2);
+                if !v.is_empty() {
+                    d.set(b"Vertices".to_vec(), arr(&v));
+                }
             }
             _ => {}
         }
