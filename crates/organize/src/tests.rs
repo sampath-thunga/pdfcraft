@@ -159,6 +159,45 @@ fn deleted_pages_are_not_kept_by_what_points_at_them() {
 }
 
 #[test]
+fn deleting_the_opening_page_drops_the_open_action() {
+    let open_action = |doc: &Document| doc.get(doc.root().unwrap()).as_dict().unwrap().get(b"OpenAction").cloned();
+    let set_open = |doc: &mut Document, value: Object| {
+        let root = doc.root().unwrap();
+        doc.update_dict(root, |c| c.set(b"OpenAction".to_vec(), value)).unwrap();
+    };
+    let page = |doc: &Document, i: usize| pages(doc).unwrap()[i].obj;
+    for as_action in [false, true] {
+        let target = |doc: &Document, i: usize| {
+            let dest = Object::Array(vec![Object::Ref(page(doc, i)), Object::Name(b"Fit".to_vec())]);
+            if as_action {
+                let mut a = Dict::new();
+                a.set(b"S".to_vec(), Object::Name(b"GoTo".to_vec()));
+                a.set(b"D".to_vec(), dest);
+                Object::Dict(a)
+            } else {
+                dest
+            }
+        };
+        // The opening page goes: no OpenAction is left to point at nothing.
+        let mut doc = doc_a();
+        let open = target(&doc, 0);
+        set_open(&mut doc, open);
+        delete_pages(&mut doc, &[0]).unwrap();
+        let out = full_roundtrip(&doc);
+        assert_eq!(labels(&out), ["A2", "A3"]);
+        assert_eq!(open_action(&out), None);
+        // Another page goes: the opening page keeps its OpenAction.
+        let mut doc = doc_a();
+        let open = target(&doc, 0);
+        set_open(&mut doc, open);
+        delete_pages(&mut doc, &[2]).unwrap();
+        let out = full_roundtrip(&doc);
+        assert_eq!(labels(&out), ["A1", "A2"]);
+        assert!(open_action(&out).is_some());
+    }
+}
+
+#[test]
 fn cannot_delete_every_page_or_missing_pages() {
     let mut doc = open(fixture());
     assert_eq!(delete_pages(&mut doc, &[0, 1, 2]), Err(OrganizeError::WouldRemoveAllPages));
