@@ -6970,8 +6970,8 @@ milestone = "M10"
 status = "shipped"
 commands = ["export.all_images"]
 tools = ["doc_export_all_images"]
-evidence = ["crates/create/src/tests.rs::images_export_as_jpeg_unchanged_and_others_as_png", "crates/create/src/tests.rs::indexed_and_one_bit_images_decode", "crates/automation/tests/automation.rs::exporting_all_images_through_tools", "crates/ui-egui/tests/export.rs::export_dialogs_write_images_and_text"]
-notes = "each image once (page resources and nested forms); JPEG unchanged, others PNG (gray/RGB/CMYK/ICC/Indexed, 1–16 bpc, stencil masks, soft mask as alpha); JPX/JBIG2/CCITT/separations reported as skipped; minimum size filter"
+evidence = ["crates/create/src/tests.rs::images_export_as_jpeg_unchanged_and_others_as_png", "crates/create/src/tests.rs::indexed_and_one_bit_images_decode", "crates/create/src/tests.rs::jpeg_images_with_a_soft_mask_export_as_png_with_alpha", "crates/create/src/tests.rs::soft_masks_of_another_size_and_stencil_and_colour_key_masks_become_alpha", "crates/automation/tests/automation.rs::exporting_all_images_through_tools", "crates/ui-egui/tests/export.rs::export_dialogs_write_images_and_text"]
+notes = "each image once (page resources and nested forms); JPEG unchanged unless it has transparency, others PNG (gray/RGB/CMYK/ICC/Indexed, 1–16 bpc, stencil masks); transparency as PNG alpha: /SMask (scaled to the image size, /Matte un-blended), stencil /Mask and colour-key /Mask, JPEG images included (#645); JPX/JBIG2/CCITT masks are left out (image exported opaque); JPX/JBIG2/CCITT/separations reported as skipped; minimum size filter"
 
 [[feature]]
 id = "create.export-html"
