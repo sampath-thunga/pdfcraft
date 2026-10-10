@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use super::*;
-use crate::spool::{Duplex, Job, lp_args, parse_lpstat};
+use crate::spool::{Duplex, Job, Printer, lp_args, parse_lpstat, parse_windows_printers, windows_env_vars};
 
 /// `n` pages of 200×300 (page 3 is landscape 300×200 when n ≥ 3); page i shows "(Page i+1)".
 /// Page 1 carries a printable square comment, a non-printing note, and a stamp.
@@ -389,6 +389,116 @@ fn the_spoolers_reply_drops_the_file_count_of_a_job_sent_on_stdin() {
         "request id is Office_Laser-13 (1 file(s))"
     );
     assert_eq!(spool::job_message(b""), "");
+}
+
+#[test]
+fn windows_printers_carry_one_default_and_keep_their_names() {
+    // Windows marks the system default with a `*` no queue name may contain; names hold spaces,
+    // parentheses and non-ASCII letters, and the lines end with CRLF.
+    let printers = parse_windows_printers("*Microsoft Print to PDF\r\nHP LaserJet 400 (Copy 2)\r\nКопир Canon iR\r\n\r\n*XPS via USB\r\n");
+    assert_eq!(printers[0], Printer { name: "Microsoft Print to PDF".into(), default: true });
+    assert_eq!(printers[1], Printer { name: "HP LaserJet 400 (Copy 2)".into(), default: false });
+    assert_eq!(printers[2], Printer { name: "Копир Canon iR".into(), default: false });
+    // A spooler marking two defaults: the first still wins, so the dialog has one to preselect.
+    assert_eq!(printers[3], Printer { name: "XPS via USB".into(), default: false });
+    assert_eq!(parse_windows_printers("\r\n"), Vec::new());
+}
+
+#[test]
+fn the_windows_job_is_the_environment_of_the_print_script() {
+    let path = std::path::Path::new("C:\\Users\\me\\AppData\\Local\\Temp\\pdfcraft-print-42.pdf");
+    let job = Job {
+        printer: Some("HP \"Laser\" Jet".into()),
+        copies: 3,
+        duplex: Duplex::ShortEdge,
+        grayscale: true,
+        title: "Angebot.pdf".into(),
+        ..Job::default()
+    };
+    let vars = windows_env_vars(path, &job);
+    let env = |key: &str| vars.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str()).unwrap();
+    assert_eq!(env("PDFCRAFT_PRINT_FILE"), "C:\\Users\\me\\AppData\\Local\\Temp\\pdfcraft-print-42.pdf");
+    // Quotes and spaces in a printer name survive because nothing goes on the command line.
+    assert_eq!(env("PDFCRAFT_PRINT_PRINTER"), "HP \"Laser\" Jet");
+    assert_eq!(env("PDFCRAFT_PRINT_COPIES"), "3");
+    assert_eq!(env("PDFCRAFT_PRINT_COLLATE"), "1");
+    assert_eq!(env("PDFCRAFT_PRINT_DUPLEX"), "short-edge");
+    assert_eq!(env("PDFCRAFT_PRINT_GRAYSCALE"), "1");
+    assert_eq!(env("PDFCRAFT_PRINT_TITLE"), "Angebot.pdf");
+    // No printer chosen means the system default: an empty name, not the word "default".
+    let one = |j: &Job, key: &str| windows_env_vars(path, j).into_iter().find(|(k, _)| k == key).unwrap().1;
+    assert_eq!(one(&Job::default(), "PDFCRAFT_PRINT_PRINTER"), "");
+    assert_eq!(one(&Job { duplex: Duplex::Off, ..Job::default() }, "PDFCRAFT_PRINT_DUPLEX"), "off");
+    assert_eq!(one(&Job { duplex: Duplex::LongEdge, ..Job::default() }, "PDFCRAFT_PRINT_DUPLEX"), "long-edge");
+}
+
+/// Run a PowerShell script for the Windows-only tests. `None` when the machine has no
+/// PowerShell or refuses to run it; those tests then skip, as the CUPS ones do without CUPS.
+#[cfg(windows)]
+fn windows_powershell(script: &str, envs: &[(&str, &str)]) -> Option<String> {
+    let mut c = std::process::Command::new("powershell");
+    c.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    for (k, v) in envs {
+        c.env(k, v);
+    }
+    let out = c.output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Windows: the printer list comes from the spooler. A bare machine may have no printer; the
+/// list that exists has real names and at most one default.
+#[cfg(windows)]
+#[test]
+fn windows_lists_the_printers_the_system_knows() {
+    let printers = spool::printers();
+    assert!(printers.iter().all(|p| !p.name.trim().is_empty()), "{printers:?}");
+    assert!(printers.iter().filter(|p| p.default).count() <= 1, "{printers:?}");
+}
+
+/// Windows: the embedded print script is valid PowerShell, checked on every machine — including
+/// runners that have no printer to print to.
+#[cfg(windows)]
+#[test]
+fn the_windows_print_script_parses() {
+    let path = std::env::temp_dir().join(format!("pdfcraft-print-script-{}.ps1", std::process::id()));
+    std::fs::write(&path, spool::WINDOWS_PRINT_SCRIPT).unwrap();
+    let errors = windows_powershell(
+        "$tokens = $null; $errors = $null; [System.Management.Automation.Language.Parser]::ParseFile($env:PDFCRAFT_TEST_SCRIPT, [ref]$tokens, [ref]$errors) > $null; $errors.Count",
+        &[("PDFCRAFT_TEST_SCRIPT", path.to_str().unwrap())],
+    );
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(errors.as_deref().map(str::trim), Some("0"), "parse errors: {errors:?}");
+}
+
+/// Windows, end to end: a job reaches the system spooler. The test printer is paused, so
+/// nothing is ever printed — the proof is the job in its queue — and its driver is the inbox
+/// "Generic / Text Only". A machine that cannot add one (no rights, no driver) skips, as the
+/// CUPS tests skip where CUPS isn't running.
+#[cfg(windows)]
+#[test]
+fn a_print_job_reaches_the_windows_spooler() {
+    const NAME: &str = "PdfCraft Test Print";
+    let added = windows_powershell(
+        &format!(
+            "if (-not (Get-Printer -Name '{NAME}' -ErrorAction SilentlyContinue)) {{ Add-Printer -Name '{NAME}' -DriverName 'Generic / Text Only' -PortName 'FILE:' }}; Set-Printer -Name '{NAME}' -IsPaused $true"
+        ),
+        &[],
+    );
+    if added.is_none() {
+        eprintln!("skipping a_print_job_reaches_the_windows_spooler: this machine cannot add the paused test printer");
+        return;
+    }
+    let pdf = impose(&fixture(1), &settings(vec![0], Layout::Size(SizeMode::Fit))).unwrap();
+    let job = Job { printer: Some(NAME.into()), title: "test.pdf".into(), ..Job::default() };
+    let sent = spool::submit(&pdf, &job);
+    let queued = windows_powershell(
+        "if (Get-PrintJob -Name 'PdfCraft Test Print') { (Get-PrintJob -Name 'PdfCraft Test Print' | Measure-Object).Count } else { 0 }",
+        &[],
+    );
+    let cleaned = windows_powershell("Get-PrintJob -Name 'PdfCraft Test Print' | Remove-PrintJob; Remove-Printer -Name 'PdfCraft Test Print'", &[]);
+    assert!(sent.is_ok(), "{sent:?}");
+    assert_eq!(queued.as_deref().map(str::trim), Some("1"), "the job is in the paused printer's queue");
+    assert!(cleaned.is_some(), "the test printer is removed again");
 }
 
 /// A PPD shaped like a Fiery's: installable options, multi-line PostScript in the choices, Latin-1
