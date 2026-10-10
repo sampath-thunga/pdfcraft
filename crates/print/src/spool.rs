@@ -357,9 +357,10 @@ fn powershell_command(script: &str) -> std::process::Command {
 }
 
 /// The Windows printer list: one line per printer, `*` on the system default. UTF-8, through
-/// the output encoding the script sets first.
+/// the output encoding the script sets first. Only the two properties the list needs are
+/// pulled, so a machine with many printers doesn't wait for the rest of each record.
 #[cfg(windows)]
-const POWERSHELL_PRINTERS: &str = "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); Get-CimInstance Win32_Printer | ForEach-Object { if ($_.Default) { '*' + $_.Name } else { $_.Name } }";
+const POWERSHELL_PRINTERS: &str = "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); Get-CimInstance Win32_Printer -Property Name, Default | ForEach-Object { if ($_.Default) { '*' + $_.Name } else { $_.Name } }";
 
 /// The Print dialog's printers from the Windows printer list: one per line, `*` before the
 /// system default (a Windows queue name may not contain `*`). The first `*` wins when a broken
@@ -392,7 +393,7 @@ pub fn submit(pdf: &[u8], job: &Job) -> Result<String, PrintError> {
     }
     #[cfg(windows)]
     {
-        windows_submit(pdf, job)
+        windows_submit(pdf, job, &[])
     }
     #[cfg(not(any(windows, all(unix, not(target_arch = "wasm32")))))]
     {
@@ -401,14 +402,15 @@ pub fn submit(pdf: &[u8], job: &Job) -> Result<String, PrintError> {
     }
 }
 
-/// [`submit`] on Windows: the print-ready PDF goes into a job file of its own (WinRT reads from
+/// [`submit`] on Windows: the print-ready PDF goes to a job file of its own (WinRT reads from
 /// a path), the embedded [`WINDOWS_PRINT_SCRIPT`] spools it, and the file is gone again however
-/// the job ended.
+/// the job ended. `extra_envs` reaches the script too — the tests use it for
+/// `PDFCRAFT_PRINT_DRYRUN`, which renders without a printer.
 #[cfg(windows)]
-fn windows_submit(pdf: &[u8], job: &Job) -> Result<String, PrintError> {
+pub(crate) fn windows_submit(pdf: &[u8], job: &Job, extra_envs: &[(&str, &str)]) -> Result<String, PrintError> {
     let path = windows_job_file(pdf)?;
     let mut ps = powershell_command(WINDOWS_PRINT_SCRIPT);
-    for (key, value) in windows_env_vars(&path, job) {
+    for (key, value) in windows_env_vars(&path, job).into_iter().chain(extra_envs.iter().map(|(k, v)| (k.to_string(), v.to_string()))) {
         ps.env(key, value);
     }
     let out = ps.output();

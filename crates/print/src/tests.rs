@@ -432,17 +432,20 @@ fn the_windows_job_is_the_environment_of_the_print_script() {
     assert_eq!(one(&Job { duplex: Duplex::LongEdge, ..Job::default() }, "PDFCRAFT_PRINT_DUPLEX"), "long-edge");
 }
 
-/// Run a PowerShell script for the Windows-only tests. `None` when the machine has no
-/// PowerShell or refuses to run it; those tests then skip, as the CUPS ones do without CUPS.
+/// Run a PowerShell script for the Windows-only tests: its stdout, or everything it said when
+/// it failed — the tests print that as the skip reason.
 #[cfg(windows)]
-fn windows_powershell(script: &str, envs: &[(&str, &str)]) -> Option<String> {
+fn windows_powershell(script: &str, envs: &[(&str, &str)]) -> Result<String, String> {
     let mut c = std::process::Command::new("powershell");
     c.args(["-NoProfile", "-NonInteractive", "-Command", script]);
     for (k, v) in envs {
         c.env(k, v);
     }
-    let out = c.output().ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    match c.output() {
+        Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
+        Ok(o) => Err(format!("{} {}", String::from_utf8_lossy(&o.stderr).trim(), String::from_utf8_lossy(&o.stdout).trim())),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Windows: the printer list comes from the spooler. A bare machine may have no printer; the
@@ -467,16 +470,23 @@ fn the_windows_print_script_parses() {
         &[("PDFCRAFT_TEST_SCRIPT", path.to_str().unwrap())],
     );
     let _ = std::fs::remove_file(&path);
-    assert_eq!(errors.as_deref().map(str::trim), Some("0"), "parse errors: {errors:?}");
+    assert_eq!(errors.as_deref().map(str::trim), Ok("0"), "parse errors: {errors:?}");
 }
 
-/// Windows, end to end: a job reaches the system spooler. The test printer is paused, so
-/// nothing is ever printed — the proof is the job in its queue — and its driver is the inbox
-/// "Generic / Text Only". A machine that cannot add one (no rights, no driver) skips, as the
-/// CUPS tests skip where CUPS isn't running.
+/// Windows, end to end: the script renders the job's sheets with Windows.Data.Pdf on any
+/// machine — CI included, no printer needed (the dry run writes the PNGs to the temporary
+/// folder) — and, where a paused test printer can be added, a real job lands in its queue.
+/// Its driver is the inbox "Generic / Text Only"; a machine that cannot add one (no rights, no
+/// driver) skips that half, as the CUPS tests skip where CUPS isn't running.
 #[cfg(windows)]
 #[test]
-fn a_print_job_reaches_the_windows_spooler() {
+fn the_print_script_renders_the_job_and_reaches_the_spooler() {
+    let pdf = impose(&fixture(2), &settings(vec![0, 1], Layout::Size(SizeMode::Fit))).unwrap();
+    // The printer name is deliberately wrong: the dry run stops before the driver is touched.
+    let job = Job { printer: Some("no such printer".into()), title: "test.pdf".into(), ..Job::default() };
+    let dry = spool::windows_submit(&pdf, &job, &[("PDFCRAFT_PRINT_DRYRUN", "1")]);
+    assert_eq!(dry.as_deref(), Ok("rendered 2 sheet(s)"), "{dry:?}");
+
     const NAME: &str = "PdfCraft Test Print";
     let added = windows_powershell(
         &format!(
@@ -484,11 +494,10 @@ fn a_print_job_reaches_the_windows_spooler() {
         ),
         &[],
     );
-    if added.is_none() {
-        eprintln!("skipping a_print_job_reaches_the_windows_spooler: this machine cannot add the paused test printer");
+    if let Err(why) = added {
+        eprintln!("skipping the real print: the test printer could not be prepared: {why}");
         return;
     }
-    let pdf = impose(&fixture(1), &settings(vec![0], Layout::Size(SizeMode::Fit))).unwrap();
     let job = Job { printer: Some(NAME.into()), title: "test.pdf".into(), ..Job::default() };
     let sent = spool::submit(&pdf, &job);
     let queued = windows_powershell(
@@ -497,8 +506,8 @@ fn a_print_job_reaches_the_windows_spooler() {
     );
     let cleaned = windows_powershell("Get-PrintJob -Name 'PdfCraft Test Print' | Remove-PrintJob; Remove-Printer -Name 'PdfCraft Test Print'", &[]);
     assert!(sent.is_ok(), "{sent:?}");
-    assert_eq!(queued.as_deref().map(str::trim), Some("1"), "the job is in the paused printer's queue");
-    assert!(cleaned.is_some(), "the test printer is removed again");
+    assert_eq!(queued.as_deref().map(str::trim), Ok("1"), "the job is in the paused printer's queue: {queued:?}");
+    assert!(cleaned.is_ok(), "the test printer is removed again: {cleaned:?}");
 }
 
 /// A PPD shaped like a Fiery's: installable options, multi-line PostScript in the choices, Latin-1
